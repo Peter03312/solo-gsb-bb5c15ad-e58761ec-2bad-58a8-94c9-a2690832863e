@@ -12,6 +12,7 @@ const yards = require('../yards');
 const movementPlan = require('../movement-plan');
 const pause = require('../pause');
 const checkpoint = require('../checkpoint');
+const routeChangeset = require('../route-changeset');
 const { withYard } = require('../db');
 
 const router = express.Router();
@@ -19,12 +20,15 @@ router.use(requireAuth('admin'));
 
 // 暂停副本：除暂停/恢复自身、从原站场创建副本与检查点（创建/回退要求副本
 // 已暂停，路由内自行校验）外，管理台所有写操作均拒绝。
+// 进路批量变更集的"预览"是只读操作（不写业务数据），暂停副本也允许预览；
+// 发布仍按写操作拒绝（409 YARD_PAUSED）。
 router.use((req, _res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD') return next();
   if (['/yards', '/yards/current/pause', '/yards/current/resume'].includes(req.path)) return next();
   if (req.path === '/yards/current/checkpoints' || req.path.startsWith('/yards/current/checkpoints/')) {
     return next();
   }
+  if (req.path === '/route-changeset/preview') return next();
   try {
     pause.assertActive(req.yard.id);
     next();
@@ -451,6 +455,23 @@ router.delete('/routes/:id', wrap((req, res) => {
   }
   triggerWaitingSweep('route_deleted');
   res.json({ ok: true });
+}));
+
+/* --------------------- 进路定义批量变更集（预览/发布） --------------------- */
+
+// 预览批量变更集：一次提交多条 create/update/delete，逐条返回校验结果、
+// 受影响等待申请（含当前阻断原因）、整批阻断原因与当前站场修订标识。
+// 只读，不写业务数据；暂停副本也可预览（结果中列出暂停阻断）。
+router.post('/route-changeset/preview', wrap((req, res) => {
+  const preview = routeChangeset.previewChangeset((req.body || {}).changes);
+  res.json({ ok: true, preview });
+}));
+
+// 发布批量变更集：携带预览返回的一次性令牌 previewId；服务端在同一事务内重验
+// 修订标识、开放进路与整批合法性，任一不满足整批不落地、等待申请保持原状。
+router.post('/route-changeset/publish', wrap((req, res) => {
+  const result = routeChangeset.publishChangeset((req.body || {}).previewId);
+  res.json({ ok: true, ...result });
 }));
 
 /* ------------------------------ 临时封锁 ------------------------------ */

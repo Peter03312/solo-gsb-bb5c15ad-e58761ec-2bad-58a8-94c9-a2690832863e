@@ -7,6 +7,7 @@ let tool = 'select';
 let drawFirst = null;        // 画区段时的第一个端点
 let routeBuilder = null;     // {steps:[sectionId], switches:[{switchId,position}]}
 let editing = null;          // 当前右键/点击编辑对象
+let changeset = null;        // 批量变更集弹窗状态 {entries, preview, awaitingRevision}
 
 const svg = document.getElementById('yard');
 const side = document.getElementById('side');
@@ -533,7 +534,14 @@ function renderSide() {
   side.appendChild(swList);
 
   // 进路清单
-  side.appendChild(html('div', { class: 'section-title' }, `进路定义（${STATE.routes.length}）`));
+  const routesTitle = html('div', { style: 'display:flex;align-items:center;gap:8px;margin:14px 0 8px;' });
+  routesTitle.appendChild(html('div', { class: 'section-title', style: 'margin:0;' },
+    `进路定义（${STATE.routes.length}）`));
+  routesTitle.appendChild(html('span', { class: 'spacer', style: 'flex:1;' }));
+  const csBtn = html('button', { class: 'ghost small' }, '📋 批量变更集（预览后发布）');
+  csBtn.addEventListener('click', openChangesetModal);
+  routesTitle.appendChild(csBtn);
+  side.appendChild(routesTitle);
   const rtList = html('div', { class: 'entity-list' });
   for (const r of STATE.routes) {
     const ent = html('div', { class: 'ent', style: 'align-items:flex-start;flex-direction:column;gap:3px;' });
@@ -925,6 +933,349 @@ function renderRouteBuilder() {
   box.appendChild(actions);
 
   return box;
+}
+
+/* ====================== 进路批量变更集（预览 → 发布） ====================== */
+
+const CS_OP = { create: '创建', update: '修改', delete: '删除' };
+
+/**
+ * 打开批量变更集弹窗。entries 为本地编辑中的变更项：
+ * {key, op, id, label, origin, destination, entrySignalId, stepsText, sw:{SW7:'N'}}
+ */
+function openChangesetModal() {
+  if (changeset && changeset.entries && changeset.entries.length) {
+    // 保留已编辑内容（一般不会并存多个弹窗）
+  } else {
+    changeset = { entries: [], preview: null };
+  }
+
+  const mask = html('div', { class: 'modal-mask' });
+  const box = html('div', { class: 'modal', style: 'width:min(920px,94vw);max-height:92vh;display:flex;flex-direction:column;' });
+  box.appendChild(html('h3', {}, '进路定义批量变更集（创建 / 修改 / 删除）'));
+  box.appendChild(html('div', { class: 'hint', style: 'margin-bottom:8px;' },
+    '一次提交多条进路变更：先点“预览”查看每条结果、受影响的等待申请与阻断原因，再携带当前站场修订标识“确认发布”。' +
+    '任一项不合法或预览后定义/引用资源/等待申请变化，整批不落地，等待申请保持原状。'));
+
+  const body = html('div', { style: 'overflow:auto;flex:1;padding-right:4px;' });
+  box.appendChild(body);
+
+  const quickRow = html('div', { class: 'row' });
+  const qCreate = html('button', { class: 'ghost small' }, '＋ 新建进路');
+  const qUpdate = html('button', { class: 'ghost small' }, '✎ 加入修改');
+  const qDelete = html('button', { class: 'ghost small' }, '✕ 加入删除');
+  qCreate.addEventListener('click', () => addCsEntry('create'));
+  qUpdate.addEventListener('click', () => { const r = pickExistingRoute(); if (r) addCsEntry('update', r); });
+  qDelete.addEventListener('click', () => { const r = pickExistingRoute(); if (r) addCsEntry('delete', r); });
+  quickRow.appendChild(qCreate);
+  quickRow.appendChild(qUpdate);
+  quickRow.appendChild(qDelete);
+  body.appendChild(quickRow);
+
+  const listBox = html('div', { style: 'margin-top:8px;' });
+  body.appendChild(listBox);
+
+  const previewBox = html('div', { style: 'margin-top:10px;' });
+  body.appendChild(previewBox);
+
+  function pickExistingRoute() {
+    const id = prompt('输入要加入变更集的现有进路编号（如 R1）：');
+    if (id == null) return null;
+    const r = STATE.routes.find((x) => x.id === id.trim());
+    return r || (toast(`进路 ${id.trim()} 在当前站场不存在`, 'err'), null);
+  }
+
+  function entryFromRoute(op, r) {
+    return {
+      key: 'e' + Date.now() + Math.random().toString(36).slice(2, 7),
+      op,
+      id: r ? r.id : '',
+      label: r ? r.label : '',
+      origin: r ? r.origin : '',
+      destination: r ? r.destination : '',
+      entrySignalId: r ? (r.entry_signal_id || '') : '',
+      stepsText: r ? r.steps.map((s) => s.section_id).join(',') : '',
+      sw: r ? Object.fromEntries(r.switchReqs.map((q) => [q.switch_id, q.req_position])) : {}
+    };
+  }
+
+  function addCsEntry(op, r) {
+    if (op !== 'create' && !r) return;
+    changeset.entries.push(entryFromRoute(op, r || null));
+    invalidatePreview();
+    renderEntries();
+  }
+
+  function invalidatePreview() {
+    if (changeset.preview) {
+      changeset.preview = null;
+      renderPreview();
+    }
+  }
+
+  function renderEntries() {
+    listBox.innerHTML = '';
+    if (!changeset.entries.length) {
+      listBox.appendChild(html('div', { class: 'hint' },
+        '尚无变更项。可用上方按钮新建进路，或把现有进路加入修改/删除。'));
+      return;
+    }
+    changeset.entries.forEach((e, idx) => listBox.appendChild(renderCsEntry(e, idx)));
+  }
+
+  function renderCsEntry(e, idx) {
+    const card = html('div', { class: 'instance-card' });
+    const head = html('div', { class: 'row' });
+    const opSel = html('select', { style: 'width:90px;' });
+    [['create', '创建'], ['update', '修改'], ['delete', '删除']].forEach(([v, t]) => {
+      const o = html('option', { value: v }, t);
+      if (e.op === v) o.selected = true;
+      opSel.appendChild(o);
+    });
+    opSel.addEventListener('change', () => {
+      e.op = opSel.value;
+      invalidatePreview();
+      renderEntries();
+    });
+    head.appendChild(opSel);
+    const idIn = html('input', { type: 'text', value: e.id, placeholder: '进路编号，如 R4',
+      style: 'width:110px;' + (e.op === 'delete' ? 'background:#f4f4f4;' : '') });
+    if (e.op === 'delete') idIn.disabled = true;
+    idIn.addEventListener('input', () => { e.id = idIn.value.trim(); invalidatePreview(); });
+    head.appendChild(html('b', {}, '#'));
+    head.appendChild(idIn);
+    head.appendChild(html('span', { style: 'flex:1;' }));
+    const rm = html('button', { class: 'danger small' }, '移出');
+    rm.addEventListener('click', () => {
+      changeset.entries.splice(idx, 1);
+      invalidatePreview();
+      renderEntries();
+    });
+    head.appendChild(rm);
+    card.appendChild(head);
+
+    if (e.op === 'delete') {
+      const r = STATE.routes.find((x) => x.id === e.id);
+      card.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' },
+        r ? `将删除：${r.origin} → ${r.destination}｜区段 ${r.steps.map((s) => s.section_id).join(',')}`
+          : '该进路当前不存在（发布将被拒绝）。'));
+      return card;
+    }
+
+    const grid = html('div', { style: 'display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:6px;' });
+    const mk = (labelText, val, oninput) => {
+      const w = html('div', {}, html('label', { class: 'hint' }, labelText),
+        html('input', { type: 'text', value: val, style: 'width:100%;box-sizing:border-box;' }));
+      w.lastChild.addEventListener('input', () => { oninput(w.lastChild.value); invalidatePreview(); });
+      return w;
+    };
+    grid.appendChild(mk('名称（可空）', e.label, (v) => { e.label = v; }));
+    grid.appendChild(mk('起点', e.origin, (v) => { e.origin = v; }));
+    grid.appendChild(mk('终点', e.destination, (v) => { e.destination = v; }));
+    const sigSel = html('select', { style: 'width:100%;box-sizing:border-box;' });
+    sigSel.appendChild(html('option', { value: '' }, '（无入口信号机）'));
+    for (const s of STATE.signals) {
+      const o = html('option', { value: s.id }, `${s.id} ${s.label}`);
+      if (s.id === e.entrySignalId) o.selected = true;
+      sigSel.appendChild(o);
+    }
+    sigSel.addEventListener('change', () => { e.entrySignalId = sigSel.value; invalidatePreview(); });
+    grid.appendChild(html('div', {}, html('label', { class: 'hint' }, '入口信号机'), sigSel));
+    card.appendChild(grid);
+
+    const stepsIn = html('input', { type: 'text', value: e.stepsText,
+      placeholder: '区段顺序，逗号分隔，如 1,3,5（不得重复）', style: 'width:100%;box-sizing:border-box;margin-top:6px;' });
+    stepsIn.addEventListener('input', () => { e.stepsText = stepsIn.value; invalidatePreview(); });
+    card.appendChild(html('div', {}, html('label', { class: 'hint' }, '经过区段（按走行顺序）'), stepsIn));
+
+    if (STATE.switches.length) {
+      const swRow = html('div', { class: 'row', style: 'margin-top:4px;flex-wrap:wrap;' });
+      for (const sw of STATE.switches) {
+        const chk = html('input', { type: 'checkbox' });
+        chk.checked = Object.prototype.hasOwnProperty.call(e.sw, sw.id);
+        const sel = html('select', {});
+        ['N', 'R'].forEach((p) => {
+          const o = html('option', { value: p }, p);
+          if ((e.sw[sw.id] || 'N') === p) o.selected = true;
+          sel.appendChild(o);
+        });
+        chk.addEventListener('change', () => {
+          if (chk.checked) e.sw[sw.id] = sel.value;
+          else delete e.sw[sw.id];
+          invalidatePreview();
+        });
+        sel.addEventListener('change', () => {
+          if (chk.checked) { e.sw[sw.id] = sel.value; invalidatePreview(); }
+        });
+        swRow.appendChild(chk);
+        swRow.appendChild(html('b', { style: 'margin-right:4px;' }, sw.id));
+        swRow.appendChild(sel);
+      }
+      card.appendChild(swRow);
+    }
+    return card;
+  }
+
+  function buildPayload() {
+    return changeset.entries.map((e) => {
+      if (e.op === 'delete') return { op: 'delete', id: e.id };
+      return {
+        op: e.op,
+        id: e.id,
+        label: e.label.trim() || e.id,
+        origin: e.origin.trim(),
+        destination: e.destination.trim(),
+        entrySignalId: e.entrySignalId || null,
+        steps: e.stepsText.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
+        switchReqs: Object.entries(e.sw).map(([switchId, position]) => ({ switchId, position }))
+      };
+    });
+  }
+
+  function renderPreview() {
+    previewBox.innerHTML = '';
+    const p = changeset.preview;
+    if (!p) {
+      previewBox.appendChild(html('div', { class: 'hint' },
+        '编辑好变更项后点“预览”：服务端只读校验整批并返回当前站场修订标识，不会改动任何数据。'));
+      return;
+    }
+
+    // 修订标识
+    const revRow = html('div', { class: 'row', style: 'align-items:center;' });
+    revRow.appendChild(html('span', { class: 'hint' }, '当前站场修订标识：'));
+    revRow.appendChild(html('code', {
+      style: 'background:#eef;padding:2px 6px;border-radius:4px;font-size:12px;user-select:all;'
+    }, p.revision));
+    previewBox.appendChild(revRow);
+    previewBox.appendChild(html('div', { class: 'hint' },
+      '修订标识为站场定义/引用资源/等待申请的内容哈希；本次预览的一次性发布令牌已由页面保存，' +
+      '点“确认发布”时自动携带（发布成功或站场变化后须重新预览）。'));
+
+    if (p.valid) {
+      previewBox.appendChild(html('div', { class: 'badge green', style: 'display:inline-block;margin:6px 0;' },
+        '整批校验通过，可发布'));
+    } else {
+      previewBox.appendChild(html('div', { class: 'badge red', style: 'display:inline-block;margin:6px 0;' },
+        '整批当前不可发布（任一项不合法发布时整批不落地）'));
+    }
+
+    // 逐条结果
+    const resTitle = html('div', { class: 'section-title', style: 'font-size:13px;margin:6px 0;' },
+      `逐条结果（创建 ${p.summary.create} / 修改 ${p.summary.update} / 删除 ${p.summary.delete}）`);
+    previewBox.appendChild(resTitle);
+    const resList = html('div', {});
+    for (const r of p.results) {
+      const line = html('div', { class: 'hint', style: 'margin:2px 0;' });
+      line.appendChild(html('b', { class: `badge ${r.valid ? 'green' : 'red'}` },
+        `第${r.index + 1}项 ${CS_OP[r.op] || r.op} ${r.routeId}`));
+      if (r.valid) {
+        const extras = [];
+        if (r.affectedWaiting && r.affectedWaiting.length) {
+          extras.push(`将使等待申请 #${r.affectedWaiting.join('、#')} 失效`);
+        }
+        if (r.releasedInstancesToDelete) extras.push(`删除 ${r.releasedInstancesToDelete} 条已解除历史实例`);
+        if (extras.length) line.appendChild(document.createTextNode('　' + extras.join('；')));
+      } else {
+        line.appendChild(html('div', { style: 'color:#b00020;margin-top:2px;' },
+          r.errors.map((m) => '✗ ' + m).join('　')));
+      }
+      resList.appendChild(line);
+    }
+    previewBox.appendChild(resList);
+
+    // 整批阻断原因
+    if (p.blockReasons.length) {
+      previewBox.appendChild(html('div', { class: 'section-title',
+        style: 'font-size:13px;margin:8px 0 4px;' }, '阻断原因'));
+      const ul = html('ul', { class: 'reasons', style: 'margin:0;' });
+      for (const reason of p.blockReasons) ul.appendChild(html('li', { style: 'color:#b00020;' }, reason));
+      previewBox.appendChild(ul);
+    }
+
+    // 受影响等待申请（含当前阻断原因）
+    if (p.affectedWaiting.length) {
+      previewBox.appendChild(html('div', { class: 'section-title',
+        style: 'font-size:13px;margin:8px 0 4px;' },
+        `受影响的等待申请（${p.affectedWaiting.length} 条，发布后失效）`));
+      const wl = html('div', {});
+      for (const w of p.affectedWaiting) {
+        const row = html('div', { class: 'hint', style: 'margin:2px 0;' });
+        row.appendChild(html('b', {}, `#${w.id} `));
+        row.appendChild(document.createTextNode(
+          `进路 ${w.routeId}｜申请人 ${w.applicant}｜道岔 ${Object.entries(w.switchPositions).map(([k, v]) => `${k}=${v}`).join(',') || '无'}`));
+        if (w.currentBlockReasons.length) {
+          row.appendChild(html('div', { class: 'muted', style: 'padding-left:10px;' },
+            '当前阻断：' + w.currentBlockReasons.join('；')));
+        }
+        wl.appendChild(row);
+      }
+      previewBox.appendChild(wl);
+    }
+  }
+
+  const actions = html('div', { class: 'actions' });
+  const previewBtn = html('button', { class: 'ghost' }, '预览');
+  const publishBtn = html('button', { class: 'primary' }, '确认发布');
+  const closeBtn = html('button', { class: 'ghost' }, '关闭');
+  publishBtn.disabled = true;
+  previewBtn.addEventListener('click', async () => {
+    const changes = buildPayload();
+    if (!changes.length) return toast('变更集为空，请先添加变更项', 'err');
+    previewBtn.disabled = true;
+    try {
+      const data = await api('/api/admin/route-changeset/preview', {
+        method: 'POST', body: JSON.stringify({ changes })
+      });
+      changeset.preview = data.preview;
+      renderPreview();
+      publishBtn.disabled = !data.preview.valid;
+      if (!data.preview.valid) toast('预览完成：当前存在阻断项，已列出原因', 'info', 5000);
+      else toast('预览完成：整批校验通过，可确认发布', 'ok', 4000);
+    } catch (e) { toast(e.message, 'err', 6000); } finally { previewBtn.disabled = false; }
+  });
+  publishBtn.addEventListener('click', async () => {
+    const p = changeset.preview;
+    if (!p) return toast('请先预览', 'err');
+    if (!confirm('确认发布整批进路变更？\n' +
+      '发布在同一事务内重新校验：预览后定义/引用资源/等待申请变化、存在开放进路或副本已暂停都会拒绝；' +
+      '任一项不合法整批不落地，等待申请保持原状。')) return;
+    publishBtn.disabled = true;
+    try {
+      const data = await api('/api/admin/route-changeset/publish', {
+        method: 'POST', body: JSON.stringify({ previewId: p.previewId })
+      });
+      const s = data.summary;
+      toast(`已发布：创建 ${s.create}、修改 ${s.update}、删除 ${s.delete} 条进路；` +
+        `失效等待申请 ${data.invalidatedWaiting.length} 条，发布后兑现 #${(data.waitingFulfilledAfter || []).join('、#') || '无'}`,
+      'ok', 6000);
+      mask.remove();
+      changeset = null;
+      await load(true);
+    } catch (e) {
+      publishBtn.disabled = false;
+      const d = e.data;
+      if (d && d.code === 'REVISION_CHANGED') {
+        changeset.preview = null;
+        renderPreview();
+        publishBtn.disabled = true;
+        const cats = (d.changes || []).map((c) => c.label + '：' + c.details.join('；')).join('\n');
+        toast(`${d.message}\n${cats}`, 'err', 9000);
+      } else {
+        toast(e.message, 'err', 8000);
+      }
+    }
+  });
+  closeBtn.addEventListener('click', () => { mask.remove(); changeset = null; });
+  actions.appendChild(previewBtn);
+  actions.appendChild(publishBtn);
+  actions.appendChild(closeBtn);
+  box.appendChild(actions);
+  mask.appendChild(box);
+  document.body.appendChild(mask);
+
+  renderEntries();
+  renderPreview();
 }
 
 boot();
