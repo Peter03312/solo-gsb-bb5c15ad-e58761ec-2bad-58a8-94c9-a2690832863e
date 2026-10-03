@@ -552,6 +552,9 @@ function renderSide() {
   if (STATE.routes.length === 0) rtList.appendChild(html('div', { class: 'hint' }, '尚无进路'));
   side.appendChild(rtList);
 
+  // 批量变更集（一次提交创建/修改/删除；先预览再确认发布）
+  side.appendChild(renderChangesetPanel());
+
   // 临时封锁
   side.appendChild(renderBlockadePanel());
 
@@ -604,6 +607,219 @@ async function resetState(url, msg) {
     toast('推演状态已重置', 'ok');
     await load(true);
   } catch (e) { toast(e.message, 'err', 6000); }
+}
+
+/* ========================== 进路批量变更集 ========================== */
+
+function renderChangesetPanel() {
+  const box = html('div', {});
+  box.appendChild(html('div', { class: 'section-title' }, '进路批量变更集'));
+  const btn = html('button', { class: 'primary small' }, '批量创建 / 修改 / 删除（先预览再发布）');
+  btn.addEventListener('click', openChangesetModal);
+  box.appendChild(html('div', { class: 'row' }, btn));
+  box.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' },
+    '一次提交多条进路的 create/update/del 变更：先在页面预览逐条结果、受影响的等待申请与阻断原因，' +
+    '确认后再发布。发布在同一事务内重验整批——任一条不合法（批内编号重复、创建重名、' +
+    '修改/删除指向不存在进路、区段重复、引用的区段/道岔/信号机不存在）则整批不落地，等待申请保持原状。'));
+  return box;
+}
+
+// 生成一条修改/删除用的当前进路模板（用户也可直接手写 JSON）
+function changesetTemplateRoute(r) {
+  return {
+    op: 'update',
+    routeId: r.id,
+    route: {
+      label: r.label,
+      origin: r.origin,
+      destination: r.destination,
+      entrySignalId: r.entry_signal_id || null,
+      steps: r.steps.map((s) => s.section_id),
+      switchReqs: r.switchReqs.map((q) => ({ switchId: q.switch_id, position: q.req_position }))
+    }
+  };
+}
+
+function openChangesetModal() {
+  const locked = STATE.openInstances.length > 0;
+  const example = {
+    changes: [
+      {
+        op: 'create', routeId: 'R9',
+        route: {
+          label: '示例新建进路', origin: 'X1', destination: 'X2', entrySignalId: 'S1',
+          steps: ['1', '2'],
+          switchReqs: [{ switchId: 'SW7', position: 'R' }]
+        }
+      },
+      ...(STATE.routes[0] ? [changesetTemplateRoute(STATE.routes[0])] : []),
+      ...(STATE.routes[1] ? [{ op: 'delete', routeId: STATE.routes[1].id }] : [])
+    ]
+  };
+  const editor = html('textarea', {
+    class: 'cs-editor', spellcheck: 'false',
+    placeholder: '在此粘贴变更集 JSON：{ "changes": [ ... ] }'
+  });
+  editor.value = JSON.stringify(example, null, 2);
+
+  const resultBox = html('div', { class: 'cs-result' });
+
+  const content = html('div', {});
+  content.appendChild(html('div', { class: 'hint', style: 'margin-bottom:8px;' },
+    '每项格式：创建/修改为 {op:"create"|"update", routeId:"R1", route:{label,origin,destination,' +
+    'entrySignalId,steps,switchReqs}}；删除为 {op:"delete", routeId:"R1"}。' +
+    '预览不写库；发布须携带预览给出的修订标识，预览后定义/资源/等待申请变化会拒绝发布。'));
+  content.appendChild(fld('变更集 JSON（changes 数组）', editor));
+  content.appendChild(resultBox);
+
+  const mask = html('div', { class: 'modal-mask' });
+  const box = html('div', { class: 'modal modal-wide' });
+  box.appendChild(html('h3', {}, '进路批量变更集'));
+  box.appendChild(content);
+  const actions = html('div', { class: 'actions' });
+  const closeBtn = html('button', { class: 'ghost' }, '关闭');
+  const previewBtn = html('button', { class: 'ghost' }, '① 预览变更集');
+  const publishBtn = html('button', { class: 'primary' }, '② 确认发布');
+  publishBtn.disabled = true;
+
+  let lastRevision = null;
+
+  function close() { mask.remove(); }
+  closeBtn.addEventListener('click', close);
+  mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
+
+  function parseEditor() {
+    let body;
+    try {
+      body = JSON.parse(editor.value);
+    } catch (e) {
+      throw new Error('变更集 JSON 解析失败：' + e.message);
+    }
+    if (!body || !Array.isArray(body.changes)) throw new Error('JSON 顶层必须包含 changes 数组');
+    return body;
+  }
+
+  function badge(text, cls) { return html('span', { class: `badge ${cls}`, style: 'margin-left:6px;' }, text); }
+
+  function renderPreview(p) {
+    resultBox.innerHTML = '';
+    lastRevision = p.revision;
+
+    const head = html('div', { class: 'row', style: 'flex-wrap:wrap;gap:6px;' });
+    head.appendChild(html('b', {}, '预览结果'));
+    head.appendChild(badge(p.valid ? '整批合法' : '存在不合法条目', p.valid ? 'green' : 'red'));
+    if (p.publishable) head.appendChild(badge('可以发布', 'green'));
+    else head.appendChild(badge('暂不能发布', 'amber'));
+    head.appendChild(html('span', { class: 'muted', style: 'margin-left:6px;font-size:12px;' },
+      `创建 ${p.counts.create} / 修改 ${p.counts.update} / 删除 ${p.counts.delete}` +
+      `｜将失效等待申请 ${p.affectedCounts.waitingToInvalidate} 条`));
+    resultBox.appendChild(head);
+
+    const rev = html('div', { class: 'hint', style: 'margin:6px 0;' });
+    rev.appendChild(html('span', {}, '当前站场修订标识（发布须原样携带）：'));
+    rev.appendChild(html('code', { class: 'cs-rev' }, p.revision));
+    resultBox.appendChild(rev);
+
+    if (p.blockReasons.length) {
+      const ul = html('div', { class: 'reasons' });
+      for (const b of p.blockReasons) ul.appendChild(html('li', {}, `🚫 ${b.message}`));
+      resultBox.appendChild(ul);
+    }
+
+    // 逐条结果
+    const opText = { create: '创建', update: '修改', delete: '删除' };
+    for (const it of p.items) {
+      const card = html('div', { class: 'instance-card', style: 'margin-top:6px;' });
+      const row = html('div', { class: 'row' });
+      row.appendChild(html('b', {}, `#${it.index} ${opText[it.op] || '?'} ${it.routeId || '（缺编号）'}`));
+      row.appendChild(html('span', { style: 'flex:1;' }));
+      row.appendChild(badge(it.valid ? '合法' : '不合法', it.valid ? 'green' : 'red'));
+      card.appendChild(row);
+      if (!it.valid) {
+        const ul = html('div', { class: 'reasons' });
+        for (const m of it.errors) ul.appendChild(html('li', {}, m));
+        card.appendChild(ul);
+      }
+      if (it.affectedWaiting && it.affectedWaiting.length) {
+        card.appendChild(html('div', { class: 'hint', style: 'margin-top:3px;' },
+          `受影响等待申请（发布后失效）：${it.affectedWaiting
+            .map((w) => `#${w.id} ${w.applicant}`).join('、')}`));
+      }
+      resultBox.appendChild(card);
+    }
+
+    publishBtn.disabled = !p.publishable;
+    if (!p.publishable) {
+      publishBtn.title = p.valid ? '当前存在发布阻断原因（见上方）' : '变更集存在不合法条目';
+    } else {
+      publishBtn.removeAttribute('title');
+    }
+  }
+
+  previewBtn.addEventListener('click', async () => {
+    try {
+      const body = parseEditor();
+      previewBtn.disabled = true;
+      const p = await App.api('/api/admin/routes/changeset/preview', {
+        method: 'POST', body: JSON.stringify(body)
+      });
+      renderPreview(p);
+      toast('预览完成：未写入任何变更', 'info', 2600);
+    } catch (e) {
+      lastRevision = null;
+      publishBtn.disabled = true;
+      toast(e.message, 'err', 7000);
+    } finally {
+      previewBtn.disabled = false;
+    }
+  });
+
+  publishBtn.addEventListener('click', async () => {
+    let body;
+    try {
+      body = parseEditor();
+    } catch (e) { return toast(e.message, 'err'); }
+    if (!lastRevision) return toast('请先预览变更集', 'err');
+    if (!confirm('确认发布整批进路变更？\n' +
+      '将在同一事务内重验整批：任一条不合法或预览后站场发生变化则整批不落地，等待申请保持原状。')) return;
+    try {
+      publishBtn.disabled = true;
+      const r = await App.api('/api/admin/routes/changeset/publish', {
+        method: 'POST', body: JSON.stringify({ ...body, revision: lastRevision })
+      });
+      toast(`已发布：创建 ${r.counts.create}、修改 ${r.counts.update}、删除 ${r.counts.delete}` +
+        `；等待申请失效 ${r.invalidatedWaiting.length} 条` +
+        (r.fulfilledWaiting.length ? `，兑现 #${r.fulfilledWaiting.join('、#')}` : ''),
+      'ok', 6000);
+      close();
+      await load(true);
+    } catch (e) {
+      publishBtn.disabled = false;
+      const code = e.data && e.data.code;
+      if (code === 'CHANGESET_REVISION_STALE') {
+        toast(`发布拒绝：预览后站场状态已变化（${(e.data.changedCategories || []).join('、')}），请重新预览`,
+          'err', 7000);
+      } else if (code === 'CHANGESET_INVALID') {
+        toast('整批不合法、未落地：\n' + e.message, 'err', 9000);
+      } else {
+        toast(e.message, 'err', 7000);
+      }
+      lastRevision = null;
+      publishBtn.disabled = true;
+    }
+  });
+
+  actions.appendChild(closeBtn);
+  actions.appendChild(previewBtn);
+  actions.appendChild(publishBtn);
+  box.appendChild(actions);
+  mask.appendChild(box);
+  document.body.appendChild(mask);
+  setTimeout(() => editor.focus(), 0);
+  if (locked) {
+    resultBox.appendChild(html('div', { class: 'reasons' },
+      html('li', {}, '⚠ 当前存在已开放进路，即使预览合法也不能发布，请待进路全部解除')));
+  }
 }
 
 /* ============================== 临时封锁 ============================== */

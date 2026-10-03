@@ -57,6 +57,17 @@
 检查点当时已到期的事项在恢复副本后立即按现有规则复核、不重复执行。原站场或运行中副本
 的创建、回退，以及未知检查点的查看、回退均拒绝。
 
+管理员整理当前站场的进路定义时，还可一次提交**进路批量变更集**：同一请求里混合多条
+创建、修改、删除。系统先做只读**预览**——返回当前站场**修订标识**、逐条是否合法及原因、
+每条受影响的等待申请（修改/删除将使相关等待申请失效）与发布阻断原因（有开放进路、
+副本已暂停）；管理员在页面确认后再**发布**。发布必须携带预览给出的修订标识，并在
+**同一事务内重验整批**：批内编号不得重复、创建不得重名、修改或删除须指向现有进路、
+区段顺序不得重复、引用的区段/道岔/信号机须存在。预览后站场定义、引用资源或等待申请
+发生变化（修订标识不符）、发布时有开放进路或副本暂停，一律拒绝并说明原因；任一项不合法
+则整批不落地、等待申请保持原状。成功时仅变更所列进路，沿用现有单条编辑对等待申请失效、
+删除历史实例与等待重试的规则，不改变区段占用、锁闭及其他站场；现有单条编辑与排路接口
+继续可用。
+
 ## 功能概览
 
 - **管理员页面**：在 SVG 站场图上绘制轨道区段、道岔、信号机，定义起终点进路
@@ -969,6 +980,133 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
 `POST /api/admin/yards/current/resume` 恢复后，按检查点状态继续运行——已到期的
 延时取消/计划步骤立即按现有规则复核，未到期的按检查点当时的剩余时间继续计时。
 
+## 进路批量变更集（一次提交创建/修改/删除，先预览再发布）
+
+管理员整理进路定义时，不必逐条保存：可把多条**创建（create）/修改（update）/
+删除（delete）**放在同一个变更集里。在管理台"进路定义"清单下方点
+**"批量创建 / 修改 / 删除（先预览再发布）"**，在弹窗中粘贴变更集 JSON，先点
+**① 预览变更集**查看逐条结果，确认无误后再点 **② 确认发布**（或调用下面的 HTTP API）。
+
+- **预览完全只读**，不写入任何内容，返回：
+  - 当前站场**修订标识 `revision`**（形如
+    `rc1.<定义摘要>.<引用资源摘要>.<等待申请摘要>`）；
+  - **逐条结果**：编号、操作类型、是否合法与全部错误原因；
+  - 每条**受影响的等待申请**（修改/删除的进路上仍在等待的申请，发布后将失效并写明
+    "批量变更集修改/删除"原因；创建不影响等待申请）；
+  - **发布阻断原因**：当前存在已开放进路（`OPEN_INSTANCES_EXIST`）、当前副本已暂停
+    （`YARD_PAUSED`）；
+  - `valid`（逐条全部合法）与 `publishable`（合法且无阻断原因）两个总判定及计数。
+- **发布必须携带预览给出的修订标识**。系统在**同一个 SQLite 事务内**重算当前修订标识
+  并重验整批，校验规则（与单条编辑一致，任一不满足整批回滚）：
+  - 批内进路编号不得重复（同一进路一批至多一条变更）；
+  - 创建不得与现有进路重名；修改/删除必须指向现有进路；
+  - 进路区段顺序不得重复，至少包含一个区段，必须填写起终点；
+  - 引用的区段、道岔与入口信号机必须存在；道岔位置要求只能是 N/R 且不得重复。
+- **预览后如有变化则拒绝发布**（`409 CHANGESET_REVISION_STALE`，响应含
+  `changedCategories`）：变化类别为 `definitions`（进路定义，含其他管理员的单条编辑）、
+  `resources`（引用的区段/道岔/信号机被增删或改结构）、`waiting`（等待申请被提交、
+  兑现、撤销、失效等）。**道岔实际扳动、区段占用变化不进修订标识**（不影响变更集
+  合法性），不会使预览过期。
+- 发布时若**有开放进路**（`409 OPEN_INSTANCES_EXIST`，与单条编辑同一把锁）或
+  **当前副本已暂停**（`409 YARD_PAUSED`，中间件统一拒绝）同样拒绝；未携带修订标识为
+  `409 CHANGESET_REVISION_REQUIRED`，标识无法识别按三类全变化处理。
+- **成功时仅变更所列进路**：修改沿用单条编辑规则——同事务使该进路全部等待申请失效；
+  删除先清理该进路已解除的历史实例（开放实例不可能存在，发布前已拒绝）、删除定义并使
+  相关等待申请失效；事务提交后按现有规则**重试等待兑现**（前项失效后资源不相交的后项
+  可立即兑现）。**不改变区段占用、道岔位置、任何锁闭及其他站场**。修订标识跨服务重启
+  稳定，重启前做的预览重启后仍可发布。
+- 现有单条编辑（`POST/PUT/DELETE /api/admin/routes…`）与值班员排路接口继续可用，
+  契约不变；单条编辑同样会改变修订标识，使未发布的旧预览过期。
+
+### 进路批量变更集 HTTP API（含调用示例）
+
+需管理员令牌（登录方式见"临时封锁 HTTP API"一节），操作作用于当前会话所选站场。
+
+**1) 预览变更集**（只读；暂停副本中也可预览，阻断原因会列出 `YARD_PAUSED`）
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/routes/changeset/preview \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"changes":[
+    {"op":"create","routeId":"R9","route":{
+      "label":"新增侧线","origin":"X1","destination":"X2","entrySignalId":"S2",
+      "steps":["1","2"],"switchReqs":[{"switchId":"SW7","position":"R"}]}},
+    {"op":"update","routeId":"R2","route":{
+      "label":"正线至侧线","origin":"X1","destination":"X4","entrySignalId":"S2",
+      "steps":["1","3","4","2"],
+      "switchReqs":[{"switchId":"SW7","position":"R"},{"switchId":"SW8","position":"R"}]}},
+    {"op":"delete","routeId":"R3"}
+  ]}'
+```
+
+返回 **200**：
+
+```json
+{"ok":true,
+ "revision":"rc1.a1b2c3d4e5f60718.9a8b7c6d5e4f3210.0f1e2d3c4b5a6978",
+ "valid":false,"publishable":false,
+ "counts":{"create":1,"update":1,"delete":1,"invalid":1},
+ "items":[
+   {"index":0,"op":"create","routeId":"R9","valid":true,"errors":[],"affectedWaiting":[]},
+   {"index":1,"op":"update","routeId":"R2","valid":true,"errors":[],
+    "affectedWaiting":[{"id":7,"routeId":"R2","applicant":"值班员乙","status":"waiting",
+      "effect":"invalidate","reason":"进路 R2 定义将被批量变更集修改，相关等待申请将失效"}]},
+   {"index":2,"op":"delete","routeId":"R3","valid":false,
+    "errors":["进路 R3 不存在，删除必须指向现有进路"],"affectedWaiting":[]}
+ ],
+ "affectedWaiting":[ /* 全部将失效等待申请的并集 */ ],
+ "affectedCounts":{"waitingToInvalidate":1,"byRoute":{"R2":1}},
+ "blockReasons":[{"code":"OPEN_INSTANCES_EXIST",
+   "message":"当前站场存在 1 条已开放进路，锁闭期间不能修改进路定义…"}]}
+```
+
+创建/修改条目的 `route` 字段与单条编辑接口完全一致（`label` 可空、`entrySignalId`
+可空或 null、`switchReqs` 可省略）；删除条目只需 `{op:"delete","routeId":"R3"}`。
+`changes` 必须是非空数组且一次不超过 200 条，否则 `400 CHANGESET_CHANGES_REQUIRED`、
+`400 CHANGESET_EMPTY`、`400 CHANGESET_TOO_LARGE`；未知操作类型等错误落在对应条目上
+（HTTP 仍为 200，`valid:false`）。
+
+**2) 确认发布**（携带预览的修订标识；同一事务重验整批，任一不合法整批不落地）
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/routes/changeset/publish \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"revision":"rc1.a1b2…0718.9a8b…3210.0f1e…6978",
+       "changes":[ /* 与预览完全相同的 changes 数组 */ ]}'
+```
+
+成功返回 **200**：
+
+```json
+{"ok":true,"published":true,"operator":"管理员",
+ "revision":"rc1.…（发布后的新修订标识）",
+ "counts":{"create":1,"update":1,"delete":0,"invalid":0},
+ "items":[ /* 发布后的逐条结果（均 valid:true） */ ],
+ "invalidatedWaiting":[7],
+ "affectedWaiting":[{"id":7,"routeId":"R2","applicant":"值班员乙","status":"invalid",
+   "effect":"invalidate","reason":"进路 R2 定义将被批量变更集修改，相关等待申请将失效"}],
+ "fulfilledWaiting":[]}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `revision` | 发布成功后的**新**修订标识（可用于下一轮预览比对；旧标识立即失效） |
+| `invalidatedWaiting` | 本事务内因修改/删除而失效的等待申请编号列表 |
+| `affectedWaiting` | 同上的逐条明细（发布后 `status` 已为 `invalid`，含失效原因） |
+| `fulfilledWaiting` | 事务提交后等待兑现重试中**新兑现**的申请编号（前项失效后后项可兑现时非空） |
+
+发布被拒（**任何变更都不落地、等待申请保持原状**）：
+
+| HTTP | code | 情形 |
+| --- | --- | --- |
+| 409 | `CHANGESET_INVALID` | 重验发现不合法条目（响应 `items` 含逐条错误，错误信息汇总在 `error`） |
+| 409 | `CHANGESET_REVISION_STALE` | 预览后定义/引用资源/等待申请变化（响应含 `changedCategories`）；标识无法识别同样返回本错误（三类全列） |
+| 409 | `CHANGESET_REVISION_REQUIRED` | 发布未携带修订标识，请先预览 |
+| 409 | `OPEN_INSTANCES_EXIST` | 发布时存在已开放进路 |
+| 409 | `YARD_PAUSED` | 当前命名演练副本已暂停（只读与预览除外） |
+| 403 / 401 | — | 值班员身份 / 未登录 |
+| 400 | `CHANGESET_CHANGES_REQUIRED` / `CHANGESET_EMPTY` / `CHANGESET_TOO_LARGE` | 请求体缺少非空 `changes` 数组或超过 200 条 |
+
 ## 数据持久化与重置
 
 - **多站场存储**：主库（默认卷内 `/data/interlock.db`）只保存**站场注册表 `yards`
@@ -988,7 +1126,12 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
   状态**（额外把示例区段置为空闲；同样撤销/清除/过期）。
   这些重置**只作用于当前会话所选站场**（顶栏"当前站场"）。
   "推演管理"中还可设置延时取消保护时长（正整数秒，仅影响之后新申请）。
-- 存在已开放进路期间，当前站场图（拓扑/进路定义）不可编辑，防止改变正在使用的线路。
+- 存在已开放进路期间，当前站场图（拓扑/进路定义）不可编辑，防止改变正在使用的线路；
+  进路**批量变更集**的发布同样先经此校验，且预览给出的修订标识在进路解除后仍须与当前
+  站场一致（走行事件不改变修订标识），否则拒绝发布。
+- 站场**修订标识**由当前进路定义（含步骤与道岔要求）、引用资源（区段/道岔/信号机的
+  结构字段）与等待申请全部状态实时计算，纯函数、无额外落库，跨服务重启稳定；区段占用
+  状态与道岔实际位置不参与（它们不影响变更集合法性）。
 - 值班员退出登录会撤销其**在各站场的**全部未兑现等待申请；进路定义被修改/删除时，
   相关未兑现申请保留记录并标记失效、写明原因（已兑现产生的进路实例记录不受影响）。
 - 服务重启后自动对**每个运行中站场**执行一次等待兑现扫描；暂停副本保持冻结，恢复后再复核；
@@ -1026,11 +1169,12 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
 │   ├── movement-plan.js       # 定时走行计划（交替占用/清空步骤/到期沿用序号注入/前提失效停止/重启续跑）
 │   ├── blockade.js            # 临时封锁（发起/结束/待生效复核/重置清除）
 │   ├── handover.js            # 交接班交接单（生成原子快照/签收同事务比对/过期/重置与重启）
+│   ├── route-changeset.js     # 进路批量变更集（修订标识/预览逐条结果与受影响等待/单事务重验发布）
 │   └── routes/
 │       ├── auth.js            # 登录/登出；GET /auth/yards、PUT /auth/yard 选择当前站场
-│       ├── admin.js           # 含副本创建/暂停恢复、保护时长、封锁、重置（均作用于当前站场）
+│       ├── admin.js           # 含副本创建/暂停恢复、保护时长、封锁、批量变更集、重置（均作用于当前站场）
 │       └── api.js             # 值班员接口（只读/预检放行；暂停期间写操作统一拒绝）
-├── public/                    # 前端页面（顶栏当前站场选择器 + 管理员创建副本入口）
+├── public/                    # 前端页面（顶栏当前站场选择器 + 管理员创建副本入口 + 批量变更集弹窗）
 └── test/
     ├── smoke.cjs              # 无需鉴权的联锁冒烟/并发测试脚本
     ├── waiting-http.cjs       # 等待申请 HTTP 端到端测试（含重启场景）
@@ -1040,13 +1184,14 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
     ├── yards-http.cjs        # 命名副本 HTTP 端到端测试（同事务复制/选择/独立运行/隔离/重启逐站场复核）
     ├── movement-plan-http.cjs# 定时走行计划 HTTP 端到端测试（校验/自动走行/人工抢先/终止/取消/重启/副本不复制）
     ├── pause-http.cjs        # 副本暂停/恢复 HTTP 端到端测试（写操作拒绝/冻结计时/退出撤销/重启/幂等）
-    └── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
+    ├── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
+    └── route-changeset-http.cjs # 批量变更集 HTTP 端到端测试（预览/修订标识过期/整批回滚/等待失效/开放进路阻断/暂停/重启）
 ```
 
 ## 测试
 
 ```bash
-npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点端到端
+npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 批量变更集端到端
 npm run smoke        # 联锁核心规则
 npm run test:waiting# 等待申请提交/撤销/顺位/自动兑现/失效/重启
 npm run test:cancel  # 延时取消申请/重复幂等/到期解除/首段占用终止/区段占用终止/重启/重置
@@ -1056,4 +1201,5 @@ npm run test:yards  # 副本同事务复制/同名拒绝/会话选择/副本与�
 npm run test:plans  # 定时走行计划提交校验/自动依序走行完成/人工抢先停止不重发/本人终止不解除/延时取消停止/重启逾期依序处理/副本不复制活动计划
 npm run test:pause  # 原站场不可暂停/写操作拒绝/定时任务冻结/退出撤销不兑现/跨重启/恢复平移与幂等
 npm run test:checkpoint # 检查点创建/重名拒绝/查看摘要/整体回退/交接单过期保留/序列水位不冲突/剩余时间冻结/已到期复核/跨重启
+npm run test:changeset # 批量变更集预览只读/修订标识三类过期/非法批整批回滚/等待失效与兑现重试/开放进路与暂停阻断/删除清理历史实例/重启标识稳定
 ```

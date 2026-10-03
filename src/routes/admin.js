@@ -12,6 +12,7 @@ const yards = require('../yards');
 const movementPlan = require('../movement-plan');
 const pause = require('../pause');
 const checkpoint = require('../checkpoint');
+const routeChangeset = require('../route-changeset');
 const { withYard } = require('../db');
 
 const router = express.Router();
@@ -25,6 +26,8 @@ router.use((req, _res, next) => {
   if (req.path === '/yards/current/checkpoints' || req.path.startsWith('/yards/current/checkpoints/')) {
     return next();
   }
+  // 批量变更集预览为只读操作，暂停副本中允许（发布仍被拒绝并说明原因）
+  if (req.path === '/routes/changeset/preview') return next();
   try {
     pause.assertActive(req.yard.id);
     next();
@@ -323,6 +326,23 @@ router.delete('/signals/:id', wrap((req, res) => {
   const r = db.prepare(`DELETE FROM signals WHERE id=?`).run(req.params.id);
   if (r.changes === 0) return res.status(404).json({ ok: false, error: `信号机 ${req.params.id} 不存在` });
   res.json({ ok: true });
+}));
+
+/* ---------------------- 进路批量变更集（预览/发布） ---------------------- */
+
+// 预览一批进路创建/修改/删除：只读，返回当前站场修订标识、逐条结果、
+// 每条受影响的等待申请与发布阻断原因（开放进路/暂停副本）。
+router.post('/routes/changeset/preview', wrap((req, res) => {
+  const preview = routeChangeset.previewChangeset(req.body || {});
+  res.json({ ok: true, ...preview });
+}));
+
+// 发布变更集：须携带预览返回的 revision；同一事务内重验整批并核对修订标识，
+// 任一项不合法或预览后状态变化则整批不落地、等待申请保持原状。
+router.post('/routes/changeset/publish', wrap((req, res) => {
+  const result = routeChangeset.publishChangeset(req.body || {}, req.session.name);
+  // 事务内等待申请失效后，后项可能满足兑现条件（与单条编辑发布后同样刷新页面数据）
+  res.status(200).json({ ok: true, ...result });
 }));
 
 /* --------------------------------- 进路 --------------------------------- */
